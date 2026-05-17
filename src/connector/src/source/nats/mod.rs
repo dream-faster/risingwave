@@ -227,9 +227,15 @@ impl NatsPropertiesConsumer {
         if let Some(v) = &self.description {
             c.description = Some(v.clone())
         }
-        if let Some(v) = &self.ack_policy {
-            c.ack_policy = AckPolicyWrapper::parse_str(v).unwrap()
-        }
+        // Always set ack_policy from `get_ack_policy()` so the broker-side and the
+        // client-side ack handling stay in sync. Pull consumers require this to be
+        // `Explicit` (the broker default); a previous bug here left the broker at
+        // its default `Explicit` while `get_ack_policy()` returned `None`, so the
+        // `WaitCheckpointTask` was never created and ACKs were never sent — JetStream
+        // then kept redelivering the same unacked messages, producing duplicates.
+        c.ack_policy = self
+            .get_ack_policy()
+            .expect("ack_policy already validated by `get_ack_policy()`");
         if let Some(v) = &self.ack_wait {
             c.ack_wait = Duration::from_secs(*v)
         }
@@ -283,10 +289,21 @@ impl NatsPropertiesConsumer {
         }
     }
 
+    /// Returns the effective `AckPolicy` for the consumer.
+    ///
+    /// When the user does not configure `consumer.ack_policy`, we default to
+    /// `Explicit`. This matches the JetStream pull consumer default on the broker
+    /// side and ensures `SourceReader::create_wait_checkpoint_task` constructs an
+    /// `AckNatsJetStream` task so that ACKs are actually sent after each checkpoint.
+    ///
+    /// Returning `AckPolicy::None` here (as the previous default did) silently
+    /// disabled the ACK path while the broker still expected explicit ACKs, which
+    /// caused JetStream to keep redelivering the same unacked messages and produced
+    /// duplicate rows in the source table.
     pub fn get_ack_policy(&self) -> ConnectorResult<AckPolicy> {
         match &self.ack_policy {
             Some(policy) => Ok(AckPolicyWrapper::parse_str(policy).map_err(ConnectorError::from)?),
-            None => Ok(AckPolicy::None),
+            None => Ok(AckPolicy::Explicit),
         }
     }
 }
@@ -390,5 +407,92 @@ mod test {
             props.nats_properties_consumer.backoff,
             Some(vec![2, 10, 15])
         );
+    }
+
+    /// Regression test for the JetStream duplicate-ingestion bug.
+    ///
+    /// When the user does not configure `consumer.ack_policy`, the connector used
+    /// to default the client-side policy to `AckPolicy::None`. The broker side
+    /// (a JetStream pull consumer) however always defaults to `AckPolicy::Explicit`,
+    /// so messages were delivered but never acknowledged, leading JetStream to
+    /// redeliver the same earliest unacked messages indefinitely and to populate
+    /// the RisingWave source table with duplicate rows.
+    ///
+    /// The effective policy must default to `Explicit` so that
+    /// `SourceReader::create_wait_checkpoint_task` constructs an
+    /// `AckNatsJetStream` task and the ACK is sent after each checkpoint.
+    /// In addition, `set_config` must propagate the same policy to the broker
+    /// config so the two sides cannot drift apart.
+    #[test]
+    fn test_default_ack_policy_is_explicit_to_avoid_jetstream_redelivery() {
+        let config: BTreeMap<String, String> = btreemap! {
+            "stream".to_owned() => "trades-okx-perps".to_owned(),
+            "subject".to_owned() => "trades.okx-perps".to_owned(),
+            "server_url".to_owned() => "nats-server:4222".to_owned(),
+            "connect_mode".to_owned() => "plain".to_owned(),
+            "type".to_owned() => "append-only".to_owned(),
+            "consumer.durable_name".to_owned() => "rw-trades-durable".to_owned(),
+            // NOTE: deliberately *no* `consumer.ack_policy` set, mirroring the
+            // reproduction in the bug report.
+        };
+
+        let props: NatsProperties =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+
+        // The user-facing string field is `None`, but the effective policy must
+        // be `Explicit` so the ACK path is activated.
+        assert_eq!(props.nats_properties_consumer.ack_policy, None);
+        assert_eq!(
+            props.nats_properties_consumer.get_ack_policy().unwrap(),
+            AckPolicy::Explicit,
+            "default ack_policy must be Explicit to match the JetStream pull \
+             consumer broker default and enable RisingWave to ACK messages \
+             after checkpoint"
+        );
+
+        // The same policy must be pushed to the broker-side `Config` so the
+        // client and broker stay in sync.
+        let mut consumer_config = Config::default();
+        props.set_config(&mut consumer_config);
+        assert_eq!(
+            consumer_config.ack_policy,
+            AckPolicy::Explicit,
+            "set_config must propagate the effective ack_policy to the broker \
+             config; otherwise the broker may default to Explicit while the \
+             client treats it as None and never sends ACKs"
+        );
+    }
+
+    /// A user-specified `consumer.ack_policy` must be honored on both sides.
+    #[test]
+    fn test_explicit_ack_policy_is_honored_end_to_end() {
+        for (input, expected) in [
+            ("none", AckPolicy::None),
+            ("all", AckPolicy::All),
+            ("explicit", AckPolicy::Explicit),
+        ] {
+            let config: BTreeMap<String, String> = btreemap! {
+                "stream".to_owned() => "s".to_owned(),
+                "subject".to_owned() => "subj".to_owned(),
+                "server_url".to_owned() => "nats:4222".to_owned(),
+                "connect_mode".to_owned() => "plain".to_owned(),
+                "type".to_owned() => "append-only".to_owned(),
+                "consumer.durable_name".to_owned() => "d".to_owned(),
+                "consumer.ack_policy".to_owned() => input.to_owned(),
+            };
+            let props: NatsProperties =
+                serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+            assert_eq!(
+                props.nats_properties_consumer.get_ack_policy().unwrap(),
+                expected,
+                "ack_policy={input}"
+            );
+            let mut consumer_config = Config::default();
+            props.set_config(&mut consumer_config);
+            assert_eq!(
+                consumer_config.ack_policy, expected,
+                "ack_policy={input} must propagate to broker config"
+            );
+        }
     }
 }
